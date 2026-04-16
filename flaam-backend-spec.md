@@ -2013,7 +2013,7 @@ MATCHING_DEFAULTS = {
 
     # ── Likes limits ──
     "daily_likes_free": 5.0,
-    "daily_likes_premium": 50.0,
+    "daily_likes_premium": 10.0,
 
     # ── Intention matrix ──
     # Matrice symétrique : on ne stocke que la moitié supérieure.

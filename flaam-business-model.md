@@ -82,7 +82,7 @@ Toutes les fonctionnalites essentielles sont en free. Le premium offre :
 
 | Fonctionnalite | Free | Premium |
 |---------------|------|---------|
-| **Likes quotidiens** | 5/jour | Illimites |
+| **Likes quotidiens** | 5/jour | **10/jour** (ajustable via admin config) |
 | **Quartiers actifs** | 3 | 5 |
 | **Quartiers "interested"** | 3 | 6 |
 | **Spots tagues** | 5 | 12 |
@@ -94,7 +94,23 @@ Toutes les fonctionnalites essentielles sont en free. Le premium offre :
 | **Blocker/reporter** | **Gratuit** | Gratuit |
 | **Ice-breakers** | **Disponibles** | Disponibles |
 | **Events Flaam** | **Acces libre** | Acces libre |
-| **Priority de rencontre** (ex super-like) | 500 FCFA/unite | 2 inclus/semaine |
+| **Priorite de rencontre** (ex super-like) | 500 FCFA/unite | 2 inclus/semaine |
+
+### Justification du choix "10 likes/jour premium" (2x le free)
+
+**Ne PAS proposer d'illimite.** Raisons :
+1. Preserve la **selectivite** : meme en premium, tu choisis avec soin
+2. Evite le **spam premium** qui degrade l'experience des cibles (surtout les femmes)
+3. Garde la **valeur du signal** : un like veut encore dire quelque chose
+4. Differencie Flaam de Tinder/Bumble/Hinge : positionnement qualite > volume
+5. Coherent avec le principe "matching reflechi > swipe-spam"
+
+**Pourquoi 10 et pas 15 ou 20 :**
+- En 5-10 min d'app/jour, un user voit 10-12 profils max dans son feed
+- 10 likes = **2x le free**, suffisant pour les vraies intentions
+- Communication : "Flaam Premium te donne 10 likes/jour, 2x plus qu'en gratuit. On pourrait te donner illimite comme Tinder, mais on prefere que tu choisisses avec attention."
+
+**Ajustement possible :** la valeur est stockee dans `MatchingConfig.daily_likes_premium` (cle configurable via admin API). Si les donnees de production montrent que les premium atteignent systematiquement le cap ou ralent, on peut passer a **15/jour en 1 minute** sans redeploiement. La valeur 10 est le point de depart courageux ; 15 est le fallback si necessaire.
 
 **Note :** les elements en **gras** sont les fonctionnalites essentielles qui restent toujours gratuites.
 
