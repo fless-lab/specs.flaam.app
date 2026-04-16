@@ -866,175 +866,651 @@ Vérifie que :
 
 ---
 
-## SESSION 11 — Cache + Erreurs + Notifications + Analytics + Logs
+## SESSION 11 — i18n centralisée + Catalogue d'erreurs
 
 ```
-Lis docs/flaam-backend-spec.md sections 20 (logging), 21 (error handling),
-25 (caching), 26 (notification templates), 29 (analytics KPIs).
+Session 11 — i18n + FlaamError.
 
-Ce sont des éléments transversaux qui touchent tout le projet.
-Regarde le code existant pour comprendre où les intégrer.
+Cette session est un REFACTORING TRANSVERSAL. Tu vas parcourir tout le 
+codebase pour centraliser les messages utilisateur en FR/EN.
 
-Implémente :
+Lis docs/flaam-backend-spec.md section 21 (error handling).
 
-1. app/core/errors.py — Catalogue d'erreurs complet (spec section 21) :
-   - Classe FlaamError(code, status_code, message_fr, message_en)
-   - 40+ codes d'erreur organisés par domaine (auth, feed, chat, payment...)
-   - Exception handler global FastAPI qui attrape FlaamError et retourne 
-     le JSON formaté : {"error": code, "message": message_fr_ou_en, "detail": ...}
-   - Détection de la langue via header Accept-Language
+IMPORTANT : cette session ne cree PAS de nouveaux endpoints. Elle 
+ameliore ce qui existe.
 
-2. app/core/cache.py — Stratégie de cache Redis (spec section 25) :
-   - cache_get(key, fallback_fn, ttl) → pattern read-through
-   - cache_invalidate(key)
-   - Stampede prevention : si le cache expire et 100 requêtes arrivent,
-     une seule regénère le cache (Redis lock NX EX)
-   - Patterns par type de donnée :
-     * feed:{user_id}:{date} → TTL 24h, invalidé au like/skip
-     * profile:{user_id} → TTL 1h, invalidé au PUT /profiles/me
-     * spots:popular:{city_id} → TTL 6h
-     * quartiers:{city_id} → TTL 24h (change rarement)
-     * matching_config → TTL 5min (cache mémoire + Redis)
-     * behavior:{user_id} → pas de TTL, persisté par cron
+Implemente :
 
-3. app/services/notification_service.py — Templates complètes (spec section 26) :
-   - 7 types de notifications avec templates FR/EN :
-     * new_match : "C'est un match ! Toi et {name} avez liké le même profil"
-     * new_message : "{name} : {preview}"  
-     * daily_feed : "Tes profils du jour sont prêts !"
-     * match_expiring : "Ton match avec {name} expire demain"
-     * event_reminder : "{event_name} dans 2h"
-     * payment_confirmed : "Premium activé ! Profite de tes avantages"
-     * safety_alert : "Timer expiré. Tout va bien ?"
-   - Deep linking scheme : flaam://feed, flaam://chat/{id}, etc.
-   - Logique d'envoi : check notification_preferences avant d'envoyer,
-     respecter le mode silencieux (pas de push entre 23h et 7h)
+1. app/core/i18n.py — Systeme de traduction minimal :
 
-4. app/tasks/analytics_tasks.py — KPIs quotidiens (spec section 29) :
-   - Celery task compute_daily_kpis() qui tourne à minuit (par timezone)
-   - Métriques calculées :
-     * Acquisition : signups, signups_completed_onboarding, by_city
-     * Engagement : daily_active, feed_views, likes, skips, messages_sent
-     * Matching : matches_created, match_rate, avg_response_time
-     * Revenue : premium_subscribers, mrr, conversion_rate
-     * Safety : reports_filed, users_banned, messages_flagged
-   - Stocke dans une table DailyKpi(date, city_id, metric, value)
-   - Exposé via GET /admin/stats
-
-5. app/core/logging.py — Structlog config (spec section 20) :
-   - Setup structlog en JSON (pour parsing par Loki/ELK)
-   - Chaque requête loggée avec : request_id, method, path, status, 
-     duration_ms, user_id (si authentifié)
-   - JAMAIS logger : tokens JWT, mots de passe, numéros de téléphone,
-     contenus de messages, photos
-   - Niveaux : INFO pour les requêtes normales, WARNING pour les 4xx,
-     ERROR pour les 5xx
-
-6. app/services/export_service.py — Export RGPD (spec section 17) :
-   - GET /profiles/me/export → génère un ZIP contenant :
-     * profile.json (toutes les données du profil)
-     * photos/ (toutes les photos)
-     * messages.json (tous les messages)
-     * matches.json (historique des matchs)
-     * spots.json (spots et check-ins)
-     * behavior.json (logs comportementaux)
-   - Endpoint dans app/api/v1/profiles.py
-
-7. app/celeryconfig.py — Beat schedule complet :
-   - generate_feeds par timezone (spec section 38)
-   - persist_behavior_scores : toutes les heures
-   - purge_expired_matches : toutes les 6h
-   - purge_old_behavior_logs : chaque lundi
-   - purge_old_feed_caches : toutes les 12h
-   - compute_daily_kpis : minuit par timezone
-   - cleanup_account_histories : mensuel
-   - compute_scam_risk : quotidien
-   - event_reminder : push 2h avant aux inscrits (toutes les 15 min)
-   - event_status_updater : ongoing/completed auto (toutes les 15 min)
-   - weekly_event_digest : dimanche soir par timezone
-   - release_waitlist_batch : toutes les 6h (MàJ 7, libère les hommes si ratio OK)
-   - NOUVEAU — check_expired_subscriptions : toutes les heures
-     * Détecte Subscription.expires_at < now AND is_active = True
-     * Appelle downgrade_user_limits() pour chaque (gel doux des extras)
-     * Notification push "Ton premium a expiré"
-   - NOUVEAU — send_reply_reminders : toutes les 4 heures
-     * Appelle reminder_service.check_pending_replies()
-     * Envoie notification push pour conversations non-répondues > 24h
-     * Max 1 reminder par match par 48h
-     * Respecte flag_reply_reminders_enabled + notification_preferences
-   - NOUVEAU — send_emergency_sms : toutes les minutes
-     * Check Redis safety:timer:{user_id} clés expirées
-     * Si timer expiré sans annulation → SMS d'urgence au contact de confiance
-     * via Termii SMS service (même provider que OTP)
-   - NOUVEAU — event_post_teaser : programmé dynamiquement
-     * Quand event passe à completed → schedule 2h après
-     * WhatsApp teaser aux ghost users non convertis
-
-8. Backup script : scripts/backup.sh
-   - pg_dump compressé + chiffré GPG
-   - Upload vers S3/R2 (ou juste local pour le moment)
-   - Rétention 7 jours local, 30 jours remote
-
-9. NOUVEAU — Fix WebSocket flaky test
-   Le test WebSocket "Event loop is closed" en full run est un bug de 
-   teardown asyncio connu avec Starlette TestClient. Il passe en isolation.
+   Dictionnaire MESSAGES avec 45+ cles, chacune ayant "fr" et "en".
+   Langue par defaut : FR (marche Togo/CI/Senegal).
    
-   Investigation : le sync_client (TestClient) et le async client (httpx) 
-   partagent le même event loop. Le teardown du sync_client ferme le loop 
-   avant que les fixtures async aient fini leur cleanup.
+   def t(key: str, lang: str = "fr", **kwargs) -> str:
+       """
+       Traduit une cle. Fallback FR si langue inconnue.
+       t("otp_sent", "fr", channel="SMS") → "Code envoyé par SMS."
+       """
    
-   Fix probable : isoler les tests WS dans un fichier séparé avec leur 
-   propre session fixture, OU utiliser un event_loop_policy qui ne ferme 
-   pas le loop au teardown.
+   def detect_lang(request: Request) -> str:
+       """Accept-Language header → 'fr' ou 'en'. Default 'fr'."""
    
-   Note : c'est un bug de test infrastructure, pas un bug applicatif. 
-   Le WebSocket fonctionne parfaitement en prod.
+   Cles a couvrir (minimum, tu peux en ajouter si tu en vois dans le code) :
+   
+   # Auth
+   otp_sent, otp_invalid, otp_expired, otp_rate_limited,
+   account_creation_blocked, token_expired, token_invalid
+   
+   # Profile
+   gender_not_modifiable, profile_incomplete, selfie_required,
+   photo_limit_reached, invalid_display_name
+   
+   # Feed / Matching
+   daily_likes_exhausted, premium_required, no_feed_available,
+   already_liked, already_skipped, match_not_found
+   
+   # Chat
+   message_blocked_insult, message_blocked_link, message_flagged_money,
+   not_match_participant, match_expired
+   
+   # Safety
+   user_blocked, user_unblocked, report_submitted, 
+   emergency_timer_started, emergency_timer_cancelled,
+   already_blocked, cannot_block_self
+   
+   # Subscription
+   premium_activated, premium_expired, payment_failed,
+   payment_confirmed, plan_not_found, already_premium
+   
+   # Events
+   event_full, event_not_found, event_checkin_success,
+   event_checkin_invalid_qr, already_registered
+   
+   # Likes received (messages affichés dans l'app)
+   likes_received_free, likes_received_empty
+   
+   # RGPD
+   account_deleted, export_ready, export_rate_limited
+   
+   # Notifications push (templates)
+   notif_new_match, notif_new_message, notif_reply_reminder,
+   notif_event_reminder, notif_daily_feed, notif_selfie_required,
+   notif_premium_expired, notif_payment_confirmed,
+   notif_safety_alert, notif_match_expiring
+   
+   # Admin
+   admin_required, user_not_found, report_not_found
 
-Vérifie que :
-- Les erreurs retournent le bon format JSON
-- Le cache read-through fonctionne (2ème appel = cache hit)
-- Le stampede lock empêche les requêtes parallèles de regénérer
-- Le Celery beat démarre avec toutes les tâches planifiées (16+ tâches)
-- L'export RGPD génère un ZIP valide
-- check_expired_subscriptions downgrade correctement les users expirés
-- send_reply_reminders respecte le cooldown 48h et les prefs
-- send_emergency_sms envoie bien le SMS quand le timer Redis expire
-- Le fix WebSocket fait passer les tests en full run sans flaky
+2. app/core/errors.py — FlaamError + handler global :
+   
+   class FlaamError(Exception):
+       def __init__(self, code: str, status_code: int = 400, 
+                    lang: str = "fr", **kwargs):
+           self.code = code
+           self.status_code = status_code
+           self.message = t(code, lang, **kwargs)
+   
+   Exception handler dans main.py :
+   @app.exception_handler(FlaamError)
+   async def flaam_error_handler(request, exc):
+       return JSONResponse(
+           status_code=exc.status_code,
+           content={"error": exc.code, "message": exc.message}
+       )
+   
+   L'ancien AppException CONTINUE de fonctionner (pas de breaking change).
+   Les nouveaux appels utilisent FlaamError, les anciens restent.
+
+3. Refactoring des services PRINCIPAUX — remplacer les strings hardcodes 
+   par t(key, lang).
+   
+   Services a refactorer en priorite :
+   
+   a. auth_service.py — messages OTP (otp_sent, otp_invalid, otp_expired,
+      otp_rate_limited, account_creation_blocked)
+   
+   b. feed_service.py — messages likes (daily_likes_exhausted, 
+      premium_required, already_liked, already_skipped)
+   
+   c. chat_service.py — messages moderation (message_blocked_insult, 
+      message_blocked_link, not_match_participant)
+   
+   d. safety_service.py — messages safety (user_blocked, report_submitted,
+      emergency_timer_started, cannot_block_self)
+   
+   e. payment_service.py — messages subscription (premium_activated, 
+      premium_expired, payment_failed, plan_not_found)
+   
+   f. event_service.py — messages events (event_full, event_not_found,
+      event_checkin_success, event_checkin_invalid_qr)
+   
+   g. profile_service.py — messages profil (gender_not_modifiable, 
+      photo_limit_reached, selfie_required)
+   
+   h. gdpr_service.py — messages RGPD (account_deleted)
+   
+   Pattern :
+   AVANT : raise AppException(400, "gender_not_modifiable")
+   APRES : raise FlaamError("gender_not_modifiable", 400, lang)
+   
+   Pour obtenir lang dans les services : ajouter lang: str = "fr" comme 
+   parametre aux fonctions de service. Les endpoints passent 
+   detect_lang(request).
+
+4. Refactoring notification_service.py — utiliser t() pour les templates :
+   
+   Remplacer les templates hardcodes par :
+   title = t(f"notif_{notif_type}", user_lang, **data)
+   
+   Ajouter quiet hours : pas de push entre 23h et 7h 
+   (timezone via City.timezone). Si hors horaire → queue pour 7h le 
+   lendemain.
+   
+   Ajouter deep linking :
+   - new_match → flaam://matches/{match_id}
+   - new_message → flaam://chat/{match_id}
+   - event_reminder → flaam://events/{event_id}
+   - daily_feed → flaam://feed
+
+5. Refactoring likes_received (feed_service.get_likes_received) :
+   Remplacer les strings message_fr/message_en par :
+   "message": t("likes_received_free", lang, count=total)
+
+6. Tests (cible +12) :
+   - test_t_returns_french_by_default
+   - test_t_returns_english
+   - test_t_fallback_french_on_unknown_lang
+   - test_t_formats_kwargs
+   - test_t_returns_key_if_missing
+   - test_detect_lang_french_default
+   - test_detect_lang_english
+   - test_flaam_error_returns_json_format
+   - test_flaam_error_with_french_message
+   - test_flaam_error_with_english_message
+   - test_feed_like_exhausted_message_french
+   - test_auth_otp_invalid_message_bilingual
+
+Verifie que :
+- TOUS les services principaux utilisent t() pour les messages user-facing
+- FlaamError handler est monte dans main.py
+- AppException continue de fonctionner (backward compat)
+- Les notifications utilisent t() avec quiet hours
+- Aucune regression (tous les tests existants passent toujours)
+
+Cible : 273 actuels + 12 = 285+ tests.
+
+Avant de coder, presente ton plan. Ne commit rien avant mon OK.
 ```
 
 ---
 
-## VÉRIFICATION FINALE
+## SESSION 12 — Cache + Celery beat + Cleanup tasks
 
 ```
-Ouvre docs/flaam-api-endpoints.md et vérifie que CHAQUE endpoint 
-listé est implémenté dans le code.
+Session 12 — Cache Redis + Celery beat complet + Cleanup tasks.
 
-Pour chaque endpoint :
-1. La route existe dans app/api/v1/
-2. Le schema request/response existe dans app/schemas/
-3. La logique métier existe dans app/services/
-4. Au moins 1 test existe dans tests/
+Cette session met en place l'infrastructure operationnelle : le cache 
+pour la performance et le Celery beat pour l'autonomie de l'app.
 
-Vérifie aussi ces éléments transversaux :
-- app/core/errors.py existe avec 40+ codes d'erreur
-- app/core/cache.py existe avec le pattern read-through
-- app/core/logging.py existe avec structlog JSON
-- app/core/idempotency.py existe avec le middleware
-- app/core/rate_limiter.py existe avec sliding window Redis
-- app/celeryconfig.py a le beat schedule complet
-- app/services/notification_service.py a les 7 templates FR/EN
-- scripts/backup.sh existe
+Lis docs/flaam-backend-spec.md sections 25 (caching), 38 (timezones).
 
-Liste-moi les endpoints manquants s'il y en a.
-Liste-moi les sections de la spec (1-40) qui n'ont pas d'implémentation.
+Implemente :
 
-Ensuite, lance :
-- pytest -v --tb=short (tous les tests)
-- ruff check app/ (lint)
-- docker compose up --build (build propre)
-- curl http://localhost:8000/docs (Swagger accessible)
-- celery -A app.celeryconfig inspect scheduled (tâches planifiées)
+1. app/core/cache.py — Pattern read-through + stampede prevention :
+   
+   async def cache_get(key, fallback_fn, ttl, redis):
+       """
+       Read-through : retourne le cache si present, sinon appelle 
+       fallback_fn et cache le resultat.
+       
+       Stampede prevention : si le cache expire et N requetes arrivent,
+       une seule regenere (Redis SET NX lock).
+       """
+       cached = await redis.get(key)
+       if cached:
+           return json.loads(cached)
+       
+       lock_key = f"lock:{key}"
+       acquired = await redis.set(lock_key, "1", nx=True, ex=30)
+       if not acquired:
+           await asyncio.sleep(1)
+           cached = await redis.get(key)
+           if cached:
+               return json.loads(cached)
+       
+       result = await fallback_fn()
+       await redis.set(key, json.dumps(result, default=str), ex=ttl)
+       await redis.delete(lock_key)
+       return result
+   
+   async def cache_invalidate(key, redis):
+       await redis.delete(key)
+   
+   async def cache_invalidate_pattern(pattern, redis):
+       """Invalide toutes les cles qui matchent (ex: feed:{user_id}:*)"""
+       keys = []
+       async for key in redis.scan_iter(match=pattern):
+           keys.append(key)
+       if keys:
+           await redis.delete(*keys)
 
-Dis-moi le résultat de chaque commande.
+2. Cabler le cache dans les services existants :
+   
+   a. feed_service.get_daily_feed :
+      key = f"feed:{user_id}:{date.isoformat()}"
+      TTL = 24h
+      Invalide au like/skip (cache_invalidate dans like_profile/skip_profile)
+   
+   b. config_service.get_config :
+      key = "matching_config:{key}"
+      TTL = 5min
+      Deja cache ? Verifie et ameliore si necessaire.
+   
+   c. Les autres caches (profile, spots, quartiers) sont optionnels 
+      pour le MVP. Ajoute juste les commentaires TODO avec les patterns.
+
+3. app/celeryconfig.py — Beat schedule complet :
+   
+   Verifie quelles taches existent deja en tant que stubs dans 
+   app/tasks/ et lesquelles manquent.
+   
+   Schedule a implementer :
+   
+   # Feeds
+   generate_all_feeds:
+     schedule: crontab(hour=3, minute=0)  # 3h UTC = 3h Lome
+   
+   # Behavior
+   persist_behavior_scores:
+     schedule: every 1 hour
+   
+   # Matching
+   release_waitlist_batch:
+     schedule: every 6 hours
+   
+   # Events
+   event_reminder:
+     schedule: every 15 minutes
+   event_status_updater:
+     schedule: every 15 minutes
+   weekly_event_digest:
+     schedule: crontab(day_of_week=0, hour=18, minute=0)  # dimanche 18h UTC
+   
+   # Subscriptions (NOUVEAU)
+   check_expired_subscriptions:
+     schedule: every 1 hour
+     task: detect Subscription.expires_at < now AND is_active=True
+           → appeler downgrade_user_limits() + notif push
+   
+   # Reminders (NOUVEAU)
+   send_reply_reminders:
+     schedule: every 4 hours
+     task: appeler reminder_service.check_pending_replies()
+           envoyer notif push, cooldown 48h, respecter prefs
+   
+   # Safety (NOUVEAU)
+   send_emergency_sms:
+     schedule: every 1 minute
+     task: scan Redis KEYS safety:timer:* 
+           pour chaque cle dont le TTL a expire → envoyer SMS Termii
+           au contact de confiance stocke dans la valeur de la cle
+           ATTENTION : Redis KEYS est O(n), utiliser SCAN en prod.
+           Pour le MVP c'est OK car peu de timers actifs simultanement.
+   
+   # Analytics
+   compute_daily_kpis:
+     schedule: crontab(hour=0, minute=30)  # 00h30 UTC
+   
+   # Cleanup
+   purge_expired_matches:
+     schedule: every 6 hours
+   purge_old_behavior_logs:
+     schedule: crontab(day_of_week=1, hour=2, minute=0)  # lundi 2h
+   purge_old_feed_caches:
+     schedule: every 12 hours
+   cleanup_account_histories:
+     schedule: crontab(day=1, hour=3, minute=0)  # 1er du mois
+   
+   # Scam
+   compute_scam_risk_batch:
+     schedule: every 24 hours
+
+   # Event post-teaser (DYNAMIQUE, pas dans beat)
+   # Schedule via .apply_async(eta=...) quand event → completed
+
+4. app/tasks/cleanup_tasks.py — Implementer la logique reelle :
+   
+   Les taches existent en tant que stubs (log only). Implemente :
+   
+   a. purge_expired_matches :
+      Match.last_message_at < now - 7 jours AND status = "matched"
+      → status = "expired"
+   
+   b. purge_old_behavior_logs :
+      BehaviorLog.created_at < now - 90 jours → delete
+   
+   c. purge_old_feed_caches :
+      Redis SCAN feed:* → verifier le TTL, supprimer les orphelins
+
+5. app/tasks/subscription_tasks.py — NOUVEAU :
+   
+   async def check_expired_subscriptions():
+       expired = select(Subscription).where(
+           Subscription.expires_at < func.now(),
+           Subscription.is_active == True
+       )
+       for sub in expired:
+           sub.is_active = False
+           user = await db.get(User, sub.user_id)
+           await downgrade_user_limits(user, db)
+           await notification_service.send_push(
+               user.id, "premium_expired", {},
+               t("notif_premium_expired", user_lang)
+           )
+
+6. app/tasks/reminder_tasks.py — NOUVEAU :
+   
+   async def send_reply_reminders():
+       # Utilise reminder_service.check_pending_replies() de S9
+       # Envoie notification push pour chaque
+       # Respecte flag + prefs + cooldown 48h
+
+7. app/tasks/emergency_tasks.py — NOUVEAU :
+   
+   async def send_emergency_sms():
+       # Scan Redis safety:timer:* 
+       # Pour chaque timer expire :
+       #   - Parse la valeur (contact_phone, contact_name, user_name, 
+       #     meeting_place)
+       #   - Envoie SMS via sms_service.send_text()
+       #   - Supprime la cle Redis
+       #   - Log l'envoi
+
+8. Tests (cible +10) :
+   - test_cache_get_miss_then_hit
+   - test_cache_invalidate_clears
+   - test_stampede_prevention (2 appels simultanes → 1 seul fallback_fn)
+   - test_feed_cache_invalidated_on_like
+   - test_check_expired_subscriptions_downgrades
+   - test_send_reply_reminders_respects_cooldown
+   - test_purge_expired_matches_changes_status
+   - test_purge_old_behavior_logs_deletes
+   - test_celery_beat_has_all_tasks (verifie 16+ entries)
+   - test_emergency_sms_sends_on_expired_timer (mock SMS)
+
+Cible : 285 + 10 = 295+ tests.
+
+Avant de coder, presente ton plan. Ne commit rien avant mon OK.
+```
+
+---
+
+## SESSION 13 — Face verification + Analytics + Export RGPD
+
+```
+Session 13 — Face verification pipeline ML + Analytics KPIs + 
+Export RGPD.
+
+Lis docs/flaam-safety-anti-fraud.md (pipeline photo, modeles ONNX).
+Lis docs/flaam-backend-spec.md sections 17 (RGPD export), 29 (KPIs).
+
+Implemente :
+
+1. app/services/face_verification_service.py :
+   
+   Le dispatcher photo est pret (S10, photo_moderation_service.py).
+   Il manque le service ML qui fait les vrais checks.
+   
+   Charge le modele ONNX UNIQUEMENT si :
+   - FACE_VERIFICATION_ENABLED=true
+   - Le fichier existe au path FACE_VERIFICATION_MODEL_PATH
+   Si fichier absent → log warning + toutes les fonctions retournent 
+   {"status": "skip", "reason": "model_not_loaded"}
+   
+   class FaceVerificationService:
+       def __init__(self):
+           self.session = None
+           if settings.face_verification_enabled:
+               model_path = settings.face_verification_model_path
+               if Path(model_path).exists():
+                   import onnxruntime as ort
+                   self.session = ort.InferenceSession(model_path)
+                   log.info("face_model_loaded", path=model_path)
+               else:
+                   log.warning("face_model_not_found", path=model_path)
+       
+       def embed_face(self, image_path: str) -> np.ndarray | None:
+           """Extrait embedding 128D du visage principal."""
+           if self.session is None:
+               return None
+           # Pre-processing : resize 112x112, normalize [-1,1], RGB
+           # Inference ONNX
+           # Post-processing : L2-normalize
+       
+       async def verify_photo_against_selfie(self, user_id, photo_path, db):
+           """
+           Cosine similarity selfie ↔ photo.
+           >= 0.7 → match
+           0.5-0.7 → warning (log)
+           0.3-0.5 → mismatch (flag_for_review)
+           < 0.3 → clear_mismatch (flag + notif admin)
+           """
+       
+       async def verify_gender_consistency(self, user_id, db):
+           """
+           Genre detecte sur selfie vs genre declare.
+           Mismatch confidence > 0.85 → flag review humaine.
+           JAMAIS auto-reject (personnes trans/NB).
+           """
+   
+   Singleton : instancier UNE FOIS au demarrage dans main.py ou via 
+   un module-level instance.
+
+2. check_photo_authenticity(file_path) dans photo_moderation_service :
+   
+   Verifie si cette fonction est deja implementee (S10 l'a peut-etre 
+   stubbee). Si stubbee, implemente la logique reelle :
+   
+   from PIL import Image
+   
+   def check_photo_authenticity(file_path: str) -> dict:
+       img = Image.open(file_path)
+       flags = []
+       
+       exif = img._getexif() if hasattr(img, '_getexif') else None
+       if exif is None:
+           flags.append("no_exif_data")
+       else:
+           if 272 not in exif:  # Camera Model
+               flags.append("no_camera_model")
+           if 36867 not in exif:  # DateTimeOriginal
+               flags.append("no_date")
+           software = str(exif.get(305, "")).lower()
+           ai_keywords = ["photoshop", "midjourney", "stable diffusion",
+                          "dall-e", "comfyui", "gimp", "canva"]
+           if any(k in software for k in ai_keywords):
+               flags.append("ai_or_editor_software")
+       
+       w, h = img.size
+       if w == h and w in (256, 512, 768, 1024, 2048):
+           flags.append("square_suspicious_resolution")
+       
+       risk = min(1.0, len(flags) * 0.2)
+       return {"flags": flags, "risk": risk}
+
+3. check_photo_temporal_diversity(photos) :
+   Si stubbee, implemente : extraire EXIF DateTimeOriginal de chaque 
+   photo. Si 4+ photos meme jour → flag risk 0.3.
+
+4. Cabler face_verification dans photo_tasks.moderate_photo_onnx :
+   Le pipeline 6 checks dans l'ordre :
+   a. EXIF authenticity (toujours)
+   b. NSFW detection (si modele dispo)
+   c. Face detection (si modele dispo)
+   d. Selfie ↔ photo comparison (face_verification_service)
+   e. Genre consistency (face_verification_service)
+   f. Temporal diversity (toujours)
+
+5. requirements-moderation.txt (NOUVEAU) :
+   onnxruntime>=1.18.0
+   opencv-python-headless>=4.9.0
+   numpy>=1.26.0
+   
+   PAS installe par defaut. Le Dockerfile ne l'installe que si 
+   PHOTO_MODERATION_MODE=onnx.
+
+6. Modele DailyKpi + Analytics :
+   
+   class DailyKpi(Base, UUIDMixin):
+       date: Mapped[date]
+       city_id: Mapped[uuid.UUID] = mapped_column(FK cities, nullable=True)
+       metric: Mapped[str] = mapped_column(String(50))
+       value: Mapped[float]
+       __table_args__ = (
+           UniqueConstraint("date", "city_id", "metric"),
+       )
+   
+   Migration Alembic pour creer la table.
+   
+   app/tasks/analytics_tasks.py :
+   async def compute_daily_kpis(target_date=None, city_id=None):
+       Metriques :
+       - signups, signups_completed, daily_active
+       - likes, skips, matches, messages
+       - premium_count, reports, bans
+       Upsert dans DailyKpi (idempotent).
+
+7. app/services/export_service.py — Export RGPD :
+   
+   async def generate_user_export(user_id, db) -> str:
+       """Genere un ZIP avec toutes les donnees de l'utilisateur."""
+       # profile.json, photos/, messages.json, matches.json, 
+       # spots.json, behavior.json
+       # Retourne le chemin du fichier ZIP
+   
+   Endpoint : GET /profiles/me/export
+   Rate limit : 1 export par 24h par user.
+   Ajouter dans app/api/v1/profiles.py.
+
+8. Tests (cible +12) :
+   - test_face_service_skip_when_model_missing
+   - test_face_service_embed_returns_128d (mock onnx session)
+   - test_face_mismatch_flags_for_review (mock onnx, similarity 0.4)
+   - test_gender_mismatch_flags_not_rejects (mock onnx)
+   - test_exif_check_flags_no_exif (photo PIL sans EXIF)
+   - test_exif_check_flags_square_resolution
+   - test_exif_check_passes_normal_photo
+   - test_temporal_diversity_flags_same_day
+   - test_compute_daily_kpis_creates_rows
+   - test_daily_kpi_upsert_idempotent
+   - test_export_generates_zip
+   - test_export_rate_limited
+
+Cible : 295 + 12 = 307+ tests.
+
+Avant de coder, presente ton plan. Ne commit rien avant mon OK.
+```
+
+---
+
+## SESSION 14 — Stabilisation finale + Fix WS + Backup + Audit
+
+```
+Session 14 — Derniere session. Stabilisation, fix, backup, audit complet.
+
+C'est la session de FINITION. Apres ca, le backend est pret pour la 
+beta privee a Lome.
+
+Implemente :
+
+1. Fix WebSocket flaky test :
+   Le test "Event loop is closed" passe en isolation mais echoue en 
+   full suite. Cause : le sync_client (Starlette TestClient) et le 
+   async client (httpx) partagent le meme event loop.
+   
+   Approche recommandee :
+   - Isoler le sync_client dans une fixture avec son propre event loop
+   - OU utiliser anyio.from_thread dans le sync_client pour eviter le 
+     conflit de loop
+   - OU separer les tests WS dans un pytest-group avec une loop_scope 
+     distincte
+   
+   Verification : pytest full suite (tous les fichiers) → 0 failures.
+
+2. app/core/logging.py — Structlog config :
+   Verifie si structlog est deja configure (S10 middleware).
+   Si oui, ameliore. Si non, cree.
+   
+   - Format JSON pour parsing Loki/ELK
+   - Processors : add_log_level, TimeStamper(fmt="iso"), 
+     StackInfoRenderer, JSONRenderer
+   - JAMAIS logger : JWT, passwords, phones, message content
+   - Integration avec RequestIDMiddleware (bind request_id au contexte)
+
+3. scripts/backup.sh :
+   #!/bin/bash
+   set -euo pipefail
+   BACKUP_DIR="/backups"
+   DATE=$(date +%Y%m%d_%H%M%S)
+   DUMP_FILE="$BACKUP_DIR/flaam_$DATE.dump.gz"
+   
+   pg_dump --format=custom "$DATABASE_URL" | gzip > "$DUMP_FILE"
+   
+   # Retention locale 7 jours
+   find "$BACKUP_DIR" -name "flaam_*.dump.gz" -mtime +7 -delete
+   
+   # TODO: upload S3/R2 en prod
+   # aws s3 cp "$DUMP_FILE" "s3://flaam-backups/$DUMP_FILE"
+   
+   echo "Backup OK: $DUMP_FILE"
+   
+   chmod +x scripts/backup.sh
+
+4. VERIFICATION FINALE — Audit complet :
+   
+   Ouvre docs/flaam-api-endpoints.md et verifie que CHAQUE endpoint 
+   liste est implemente dans le code.
+   
+   Pour chaque endpoint :
+   a. La route existe dans app/api/v1/
+   b. Le schema request/response existe dans app/schemas/
+   c. La logique metier existe dans app/services/
+   d. Au moins 1 test existe dans tests/
+   
+   Verifie aussi ces elements transversaux :
+   - app/core/i18n.py existe avec 45+ cles FR/EN
+   - app/core/errors.py existe avec FlaamError + handler
+   - app/core/cache.py existe avec read-through + stampede
+   - app/core/logging.py existe avec structlog JSON
+   - app/core/idempotency.py existe avec le middleware
+   - app/core/rate_limiter.py existe avec sliding window Redis
+   - app/celeryconfig.py a le beat schedule (16+ taches)
+   - app/services/notification_service.py utilise t() + quiet hours
+   - app/services/face_verification_service.py existe (skip si pas de modele)
+   - scripts/backup.sh existe et est executable
+   
+   Liste-moi les endpoints manquants s'il y en a.
+   Liste-moi les sections de la spec (1-40) qui n'ont pas d'implementation.
+
+5. Tests finaux :
+   - test_structlog_json_format
+   - test_full_suite_no_flaky (run ALL tests → 0 failures)
+   
+   Cible finale : 310+ tests, 0 failures, 0 flaky.
+
+6. Lancement des commandes de verification :
+   - docker compose exec api pytest --tb=short -q (tous les tests)
+   - docker compose exec api ruff check app/ (lint)
+   - docker compose up --build (build propre)
+   - curl http://localhost:8000/docs (Swagger accessible)
+   
+   Dis-moi le resultat de chaque commande.
+
+7. Commit final :
+   Message : "Session 14: stabilization + WS fix + backup + audit (XXX tests)"
+   Tag v1.0.0-beta
+   Push.
+
+C'est la derniere session. Apres ca, Flaam backend est pret pour la 
+beta privee a Lome.
 ```
