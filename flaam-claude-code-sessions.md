@@ -629,143 +629,239 @@ Vérifie que :
 
 ---
 
-## SESSION 10 — Admin + Hardening final + Photo moderation
+## SESSION 10 — Admin + Safety pipeline + Photo moderation + Premium downgrade
 
 ```
 Lis docs/flaam-api-endpoints.md section Admin (22 endpoints) et 
 docs/flaam-backend-spec.md sections 17-29 (RGPD, monitoring, CI/CD, etc.)
-Lis aussi section 16.1b (Modération photo — 3 modes switchables par ENV).
+Lis aussi :
+- Section 16.1b (Modération photo — 3 modes switchables par ENV)
+- MàJ 9 (Genre immutable, premium downgrade, pipeline photo 6 checks, 
+  targeted likes, reply reminders)
+- docs/flaam-safety-anti-fraud.md (document complet anti-fraude)
+- docs/flaam-business-model.md (principes éthiques + pricing)
+- docs/flaam-ai-scoping.md (hooks IA futurs)
+
+C'est la session la plus large et la plus critique pour la production.
+Prends le temps de tout lire.
 
 Implémente :
 
+=== BLOC A — Admin API (22 endpoints) ===
+
 1. app/api/v1/admin.py — 22 endpoints admin :
-   - Reports CRUD
-   - Ban/unban
-   - Stats dashboard
-   - Events : POST /admin/events (créer), PATCH /admin/events/{id} (publier/annuler),
-     GET /admin/events (liste par status/ville), DELETE /admin/events/{id}
-   - Photos modération (queue + approve/reject — détails ci-dessous)
-   - Spots validation
-   - Matching config
-   - Feature flags
-   - Trigger batch matching
-   - Ambassadrices (MàJ 7) : POST/DELETE/GET /admin/ambassadors
-   - Waitlist (MàJ 7) : GET /admin/waitlist/stats, POST /admin/waitlist/release
+   - Reports CRUD (list pending, detail, resolve)
+   - Ban/unban user
+   - Stats dashboard (users actifs, matches/jour, H/F ratio, churn)
+   - Events : POST /admin/events (créer), PATCH /admin/events/{id} 
+     (publier/annuler), GET /admin/events (liste par status/ville), 
+     DELETE /admin/events/{id}
+   - Photos modération (voir Bloc B ci-dessous)
+   - Spots validation (approve/reject spots créés par users)
+   - Matching config : GET/PATCH /admin/matching-config/{key}
+   - Feature flags : GET/PATCH pour flag_* keys
+   - Trigger batch matching : POST /admin/matching/trigger-batch
+   - Ambassadrices : POST/DELETE/GET /admin/ambassadors
+   - Waitlist : GET /admin/waitlist/stats, POST /admin/waitlist/release
 
-2. app/services/photo_moderation_service.py — dispatcher des 3 modes :
-   - Lis la variable settings.photo_moderation_mode ("manual" | "onnx" 
-     | "external" | "off")
-   - Mode "manual" : ne fait rien, la photo reste pending
-   - Mode "onnx" : enqueue moderate_photo_onnx
-   - Mode "external" : enqueue moderate_photo_external
-   - Mode "off" : auto-approve direct
-   - Appelé systématiquement après upload_photo dans photo_service
-
-3. app/tasks/photo_tasks.py — les 2 workers de modération :
+2. NOUVEAU — PATCH /admin/users/{user_id}/gender :
+   Endpoint pour changement de genre par admin (review humaine).
+   Le genre n'est PAS modifiable par l'utilisateur via PUT /profiles/me.
    
-   a. moderate_photo_onnx(photo_id) :
-      - Charge NSFW_MODEL_PATH + FACE_MODEL_PATH via onnxruntime 
-        (charger UNE fois au démarrage du worker, pas à chaque photo)
-      - Télécharge la photo medium (600px suffit pour la classification)
-      - Inférence NSFW → score 0-1
-      - Inférence face detection → nombre de visages
-      - Applique les seuils :
-        * NSFW > NSFW_THRESHOLD_REJECT (0.7) → moderation_status="rejected", 
-          moderation_reason="nsfw"
-        * NSFW entre THRESHOLD_REVIEW (0.4) et REJECT (0.7) → "manual_review"
-        * Pas de visage détecté ET score NSFW < 0.4 → "manual_review", 
-          reason="no_face"
-        * Sinon → "approved"
-      - Update Photo.nsfw_score, moderation_status, moderated_at
+   Ce que fait cet endpoint :
+   a. Change Profile.gender
+   b. INVALIDE le selfie (User.is_selfie_verified = False)
+   c. RESET le behavior_multiplier (delete Redis behavior:{user_id})
+   d. Notifie l'utilisateur ("Reprends un selfie pour vérifier")
+   e. Log l'action avec admin_id + raison + old/new gender
    
-   b. moderate_photo_external(photo_id) :
-      - Appelle l'API Sightengine (endpoint /1.0/check.json)
-      - Credentials depuis SIGHTENGINE_USER + SIGHTENGINE_SECRET
-      - Modèles appelés : "nudity-2.0,face-attributes"
-      - Parse la réponse : nudity.sexual_activity, nudity.sexual_display, 
-        face.count
-      - Max 3 retries avec backoff 1s/5s/15s si l'API est down
-      - Si > 3 échecs : fallback vers "manual_review" pour review humaine
-      - Même seuils et même logique de statuts que le mode onnx
+   Ajoute aussi dans profile_service.update_profile() :
+   if "gender" in data:
+       raise AppException(400, "gender_not_modifiable")
 
-4. Endpoints admin pour la modération manuelle :
-   - GET /admin/photos/pending?status=pending|manual_review — liste paginée
-   - GET /admin/photos/pending/stats — compteurs par statut
-   - PATCH /admin/photos/{photo_id}/moderation avec body 
-     {"action": "approve"|"reject", "reason": "..."}
-   - POST /admin/photos/bulk-approve avec liste d'IDs (gain de temps)
+3. NOUVEAU — GET /admin/prompts/stats :
+   Retourne les prompts les plus likés (compteur prompt_like_count 
+   dans le JSONB prompts de Profile). Pour le A/B testing des prompts.
+   Trié par like_count desc, top 20.
+
+=== BLOC B — Pipeline modération photos (6 checks) ===
+
+4. app/services/photo_moderation_service.py — dispatcher des 4 modes :
+   - Mode "manual" : ne fait rien, photo reste pending
+   - Mode "onnx" : enqueue le pipeline complet (6 checks)
+   - Mode "external" : appel API Sightengine
+   - Mode "off" : auto-approve (tests uniquement)
+   Appelé systématiquement après upload_photo dans photo_service.
+
+5. app/services/face_verification_service.py — NOUVEAU :
+   - Charge ArcFace ONNX (~30 MB) UNE FOIS au démarrage
+   - embed_face(image_path) → np.ndarray 128D ou None
+   - verify_photo_against_selfie(user_id, photo_path, db) :
+     * Cosine similarity selfie ↔ photo
+     * >= 0.7 → OK, 0.5-0.7 → warning, 0.3-0.5 → flag, < 0.3 → flag+admin
+   - verify_gender_consistency(user_id, db) :
+     * Genre détecté sur selfie vs genre déclaré
+     * Mismatch avec confidence > 0.85 → flag review humaine
+     * JAMAIS auto-reject (personnes trans/NB légitimes)
+   - Config ENV : FACE_VERIFICATION_ENABLED (default false)
+
+6. check_photo_authenticity(file_path) dans photo_moderation_service :
+   - Pas d'EXIF → flag
+   - Pas de modèle camera → flag
+   - Software AI (photoshop, midjourney, stable diffusion) → flag
+   - Résolution carrée suspecte (512, 1024, 2048) → flag
+   - Risk > 0.5 → manual_review
+   - Config ENV : EXIF_CHECK_ENABLED (default true)
+
+7. check_photo_temporal_diversity(photos) :
+   - 4+ photos même date EXIF → flag
+   - Config : toujours actif quand EXIF_CHECK_ENABLED=true
+
+8. Pipeline complet (mode onnx) — 6 checks dans l'ordre :
+   a. EXIF authenticity (< 1ms, pur Python)
+   b. NSFW detection (~100ms, ONNX)
+   c. Face detection (~50ms, YuNet ONNX)
+   d. Selfie ↔ photo comparison (~200ms, ArcFace ONNX)
+   e. Genre consistency (inclus InsightFace)
+   f. Temporal diversity (< 1ms, EXIF dates)
    
-   Ces endpoints marchent dans TOUS les modes — même en mode "onnx", l'admin 
-   peut toujours override manuellement. En mode "manual", c'est la seule 
-   façon d'approuver les photos.
+   Decision : approved | manual_review | rejected
 
-5. Dockerfile : ajout conditionnel des modèles ONNX
-   - Si PHOTO_MODERATION_MODE=onnx au build → COPY models/ /models/
-   - Sinon, pas de copie (image plus petite)
-   - Ajouter onnxruntime aux requirements UNIQUEMENT si mode onnx ou external
-     (opencv-python-headless aussi pour le pré-processing d'images)
-   
-   En pratique : 2 requirements files :
-   - requirements.txt (commun)
-   - requirements-moderation.txt (onnx, opencv-python-headless, 
-     pillow-simd) — installé conditionnellement
+9. Endpoints admin modération photos :
+   - GET /admin/photos/pending?status=pending|manual_review
+   - GET /admin/photos/pending/stats (compteurs par statut)
+   - PATCH /admin/photos/{photo_id}/moderation (approve/reject)
+   - POST /admin/photos/bulk-approve (liste d'IDs)
 
-6. app/services/gdpr_service.py (spec section 17) :
-   - initiate_deletion(user_id) → Phase 1 immédiate
-   - Celery tasks pour Phase 2 (J+7) et Phase 3 (J+30)
+10. app/tasks/photo_tasks.py — workers modération :
+    a. moderate_photo_onnx(photo_id) : pipeline complet 6 checks
+    b. moderate_photo_external(photo_id) : API Sightengine + fallback
+    
+    Modèles ONNX (pas téléchargés en Session 10, juste le code) :
+    - ArcFace ResNet50 (~30 MB) pour face embeddings
+    - YuNet (~2 MB) pour face detection
+    - NSFW Classifier (~50 MB) pour contenu adulte
+    
+    2 requirements files :
+    - requirements.txt (commun)
+    - requirements-moderation.txt (onnxruntime, opencv-python-headless)
 
-7. app/tasks/cleanup_tasks.py :
-   - purge_expired_matches (7 jours sans message)
-   - purge_old_behavior_logs (90 jours)
-   - purge_old_feed_caches (2 jours)
-   - cleanup_account_histories (politique de rétention)
+=== BLOC C — Premium downgrade (gel doux) ===
 
-8. app/core/middleware.py :
-   - Security headers (X-Content-Type-Options, X-Frame-Options, etc.)
-   - Request ID (X-Request-ID)
-   - Structured logging (chaque requête loggée avec durée, status, user_id)
+11. app/services/subscription_service.py — NOUVEAU ou extension :
+    
+    async def downgrade_user_limits(user, db):
+        """Gel doux : les extras passent is_active_in_matching=False."""
+        # Quartiers physiques : garder 3 plus anciens actifs
+        # Quartiers interested : garder 3 plus anciens actifs
+        # Spots : garder 5 plus anciens actifs
+        # User.is_premium = False
+    
+    async def upgrade_user_limits(user, db):
+        """Réactivation instantanée."""
+        # Tout repasse à is_active_in_matching=True
+        # User.is_premium = True
 
-9. Prometheus metrics endpoint (/metrics) si possible, sinon skip
+12. Migration Alembic : ajouter is_active_in_matching (Boolean, default True) 
+    sur UserQuartier et UserSpot si pas déjà fait.
+    Ajouter like_target_type (String(10), nullable), like_target_id 
+    (String(100), nullable), like_comment (String(200), nullable) sur Match.
 
-10. Tests :
-    - Routes admin retournent 403 pour un user normal
-    - Mode "off" : upload photo → auto-approved direct
-    - Mode "manual" : upload photo → reste pending
-    - Mode "onnx" : mock onnxruntime InferenceSession, vérifie que 
-      le dispatcher appelle bien moderate_photo_onnx
-    - Mode "external" : mock httpx pour Sightengine, vérifie parsing 
-      de la réponse
-    - PATCH /admin/photos/{id}/moderation approve → status="approved"
-    - PATCH /admin/photos/{id}/moderation reject → status="rejected", 
-      reason stored
+13. Modifier les scorers matching (L1 hard_filters, L2 geo_scorer) pour 
+    filtrer uniquement sur is_active_in_matching=True.
 
-11. .github/workflows/backend.yml — CI pipeline :
+=== BLOC D — Targeted likes + Reply reminders ===
+
+14. Modifier POST /feed/{profile_id}/like pour accepter optionnellement :
+    target_type ("photo"|"prompt"|"profile", default "profile")
+    target_id (uuid ou index du prompt)
+    comment (max 200 chars)
+    
+    Si target_type != "profile" et comment présent :
+    → l'ice-breaker auto-généré est REMPLACÉ par le commentaire
+    
+    Feature flag : flag_targeted_likes_enabled (default 0.0 = désactivé)
+    Quand désactivé, les champs sont ignorés silencieusement.
+    
+    Tracking A/B : quand un like cible un prompt, incrémenter 
+    prompt_like_count dans le JSONB prompts du Profile.
+
+15. app/services/reminder_service.py — NOUVEAU :
+    - check_pending_replies(db) : conversations avec message non-répondu > 24h
+    - Max 1 reminder par match par 48h
+    - Respecte notification_preferences
+    - Stub Celery (scheduling Session 11)
+    
+    Feature flag : flag_reply_reminders_enabled (default 1.0 = activé)
+    Template : "Tu n'as pas encore répondu à {name}."
+
+=== BLOC E — RGPD + Middleware + CI/CD ===
+
+16. app/services/gdpr_service.py (spec section 17) :
+    - initiate_deletion(user_id) → Phase 1 immédiate
+    - Celery stubs pour Phase 2 (J+7) et Phase 3 (J+30)
+
+17. app/core/middleware.py :
+    - Security headers (X-Content-Type-Options, X-Frame-Options, etc.)
+    - Request ID (X-Request-ID)
+    - Structured logging (chaque requête loggée avec durée, status, user_id)
+
+18. .github/workflows/backend.yml — CI pipeline :
     - Lint (ruff)
-    - Tests (pytest)
-    - Build Docker image (mode "off" pour les tests CI)
-    - (Le déploiement sera configuré plus tard)
+    - Tests (pytest avec PHOTO_MODERATION_MODE=off)
+    - Build Docker image
+    
+=== BLOC F — Tests (cible 230+) ===
 
-Stratégie MVP → production :
-- Session 10 : PHOTO_MODERATION_MODE=manual par défaut en .env.example
-- Lancement Lomé : admin modère à la main pendant 2-3 mois (~60 photos/jour, 
-  30min/jour à 2 personnes)
-- Quand > 100 photos/jour : basculer en mode onnx
-- Quand > 1000 photos/jour : évaluer external si CPU sature
+Tests admin :
+- test_admin_routes_403_for_normal_user
+- test_admin_ban_user
+- test_admin_create_event
+- test_admin_change_gender_invalidates_selfie
+- test_admin_prompts_stats
 
-Téléchargement des modèles ONNX (pour plus tard, pas dans Session 10) :
-- NSFW : https://github.com/yahoo/open_nsfw ou 
-  https://github.com/GantMan/nsfw_model/releases (convertir en ONNX si 
-  nécessaire)
-- Face detection : YuNet (OpenCV) ou UltraFace RFB-320 (~2 MB, ONNX natif)
+Tests photo moderation :
+- test_mode_off_auto_approves
+- test_mode_manual_stays_pending
+- test_mode_onnx_dispatches (mock onnxruntime)
+- test_exif_check_flags_no_exif
+- test_exif_check_flags_square_resolution
+- test_face_verification_mismatch_flags (mock ArcFace)
+- test_gender_mismatch_flags_for_review (PAS auto-reject)
+- test_admin_approve_photo
+- test_admin_reject_photo
+- test_admin_bulk_approve
+
+Tests premium downgrade :
+- test_downgrade_gels_extra_quartiers
+- test_downgrade_gels_extra_spots
+- test_upgrade_reactivates_all
+- test_matching_ignores_inactive_quartiers
+- test_matching_ignores_inactive_spots
+
+Tests targeted likes :
+- test_like_with_target_photo (flag activé)
+- test_like_with_target_ignored_when_flag_disabled
+- test_like_with_comment_replaces_icebreaker
+- test_prompt_like_count_incremented
+
+Tests reply reminders :
+- test_reminder_finds_pending_replies
+- test_reminder_respects_48h_cooldown
+- test_reminder_respects_disabled_pref
+
+Tests RGPD :
+- test_gdpr_phase1_anonymizes
+- test_gdpr_deleted_user_blocked_from_login
 
 Vérifie que :
 - Toutes les routes admin retournent 403 pour un user normal
-- Le dispatcher switche bien entre les 4 modes selon l'ENV
-- Les 4 modes sont testables (même sans les vrais modèles ONNX, via mocks)
-- La suppression RGPD phase 1 anonymise immédiatement
+- Le dispatcher photo switche entre les 4 modes selon ENV
+- Le genre est rejeté dans PUT /profiles/me (400 gender_not_modifiable)
+- Le changement admin de genre invalide le selfie
+- Le downgrade gèle les extras sans supprimer
 - Le CI passe au vert
-- TOUS les 111 endpoints sont implémentés (vérifier avec 
-  docs/flaam-api-endpoints.md)
+- TOUS les endpoints sont implémentés (vérifier avec docs/flaam-api-endpoints.md)
 ```
 
 ---
@@ -857,18 +953,53 @@ Implémente :
    - event_status_updater : ongoing/completed auto (toutes les 15 min)
    - weekly_event_digest : dimanche soir par timezone
    - release_waitlist_batch : toutes les 6h (MàJ 7, libère les hommes si ratio OK)
+   - NOUVEAU — check_expired_subscriptions : toutes les heures
+     * Détecte Subscription.expires_at < now AND is_active = True
+     * Appelle downgrade_user_limits() pour chaque (gel doux des extras)
+     * Notification push "Ton premium a expiré"
+   - NOUVEAU — send_reply_reminders : toutes les 4 heures
+     * Appelle reminder_service.check_pending_replies()
+     * Envoie notification push pour conversations non-répondues > 24h
+     * Max 1 reminder par match par 48h
+     * Respecte flag_reply_reminders_enabled + notification_preferences
+   - NOUVEAU — send_emergency_sms : toutes les minutes
+     * Check Redis safety:timer:{user_id} clés expirées
+     * Si timer expiré sans annulation → SMS d'urgence au contact de confiance
+     * via Termii SMS service (même provider que OTP)
+   - NOUVEAU — event_post_teaser : programmé dynamiquement
+     * Quand event passe à completed → schedule 2h après
+     * WhatsApp teaser aux ghost users non convertis
 
 8. Backup script : scripts/backup.sh
    - pg_dump compressé + chiffré GPG
    - Upload vers S3/R2 (ou juste local pour le moment)
    - Rétention 7 jours local, 30 jours remote
 
+9. NOUVEAU — Fix WebSocket flaky test
+   Le test WebSocket "Event loop is closed" en full run est un bug de 
+   teardown asyncio connu avec Starlette TestClient. Il passe en isolation.
+   
+   Investigation : le sync_client (TestClient) et le async client (httpx) 
+   partagent le même event loop. Le teardown du sync_client ferme le loop 
+   avant que les fixtures async aient fini leur cleanup.
+   
+   Fix probable : isoler les tests WS dans un fichier séparé avec leur 
+   propre session fixture, OU utiliser un event_loop_policy qui ne ferme 
+   pas le loop au teardown.
+   
+   Note : c'est un bug de test infrastructure, pas un bug applicatif. 
+   Le WebSocket fonctionne parfaitement en prod.
+
 Vérifie que :
 - Les erreurs retournent le bon format JSON
 - Le cache read-through fonctionne (2ème appel = cache hit)
 - Le stampede lock empêche les requêtes parallèles de regénérer
-- Le Celery beat démarre avec toutes les tâches planifiées
+- Le Celery beat démarre avec toutes les tâches planifiées (16+ tâches)
 - L'export RGPD génère un ZIP valide
+- check_expired_subscriptions downgrade correctement les users expirés
+- send_reply_reminders respecte le cooldown 48h et les prefs
+- send_emergency_sms envoie bien le SMS quand le timer Redis expire
+- Le fix WebSocket fait passer les tests en full run sans flaky
 ```
 
 ---

@@ -63,7 +63,7 @@ Une seule requête SQL massive. C'est binaire : tu passes ou tu ne passes pas.
 4. **Selfie vérifié** — obligatoire pour apparaître dans les feeds.
 5. **Genre compatible (bidirectionnel)** — si moi je cherche des femmes ET elle cherche des hommes. Les deux directions doivent matcher.
 6. **Âge compatible (bidirectionnel)** — je veux 22-30 ET elle veut 25-35, l'intersection [25-30] doit exister.
-7. **Intentions compatibles** — via la matrice 4×4 en version binaire. Serious × friendship_first = 0.1, donc exclu au niveau filtre.
+7. **Intentions compatibles** — via la matrice 4×4 en version binaire. Serious × friendship = 0.1, donc exclu au niveau filtre.
 8. **Pas bloqué (bidirectionnel)** — ni moi ne l'ai bloqué, ni lui ne m'a bloqué.
 9. **Pas dans ma blacklist contacts** — vérification par phone_hash SHA-256. Si mon ex est sur l'app, on ne se voit jamais.
 10. **Pas déjà vu récemment** — pas skippé dans les 30 derniers jours, pas déjà matché (pending ou actif).

@@ -1009,6 +1009,12 @@ class UserSpot(Base, UUIDMixin, TimestampMixin):
     # L'utilisateur peut masquer un spot de son profil public
     # Il reste pris en compte pour le matching mais n'est pas affiché
 
+    is_active_in_matching: Mapped[bool] = mapped_column(default=True)
+    # Gel doux lors de l'expiration du premium.
+    # Quand premium expire : les spots au-delà de la limite free (5)
+    # passent à False. Données conservées, juste ignorées par le matching.
+    # Réactivation instantanée quand premium se réactive.
+
     user = relationship("User", back_populates="user_spots")
     spot = relationship("Spot", lazy="selectin")
 
@@ -1060,6 +1066,14 @@ class UserQuartier(Base, UUIDMixin, TimestampMixin):
     is_primary: Mapped[bool] = mapped_column(default=False)
     # True si c'est le quartier principal (1 seul "lives" peut être primary)
     # Utilisé pour l'affichage "Ama · Tokoin" sur le profil résumé
+
+    is_active_in_matching: Mapped[bool] = mapped_column(default=True)
+    # Gel doux lors de l'expiration du premium.
+    # Quand premium expire : les quartiers au-delà de la limite free (3 physiques,
+    # 3 interested) passent à False. Ils restent en DB (pas de suppression de données),
+    # mais sont ignorés par les scorers L1/L2 du matching.
+    # Quand premium se réactive : tout repasse à True instantanément.
+    # L'utilisateur peut aussi choisir lesquels garder actifs via l'app.
 
     user = relationship("User", back_populates="user_quartiers")
     quartier = relationship("Quartier", lazy="selectin")
@@ -2013,16 +2027,13 @@ MATCHING_DEFAULTS = {
 
     # ── Likes limits ──
     "daily_likes_free": 5.0,
-    "daily_likes_premium": 10.0,
+    "daily_likes_premium": 50.0,
 
     # ── Intention matrix ──
-    # Matrice symétrique : on ne stocke que la moitié supérieure.
-    # La complétion symétrique (ex. intention_friendship_first_serious = 0.1)
-    # est gérée par INTENTION_COMPATIBILITY_MATRIX dans app/core/constants.py.
     "intention_serious_serious": 1.0,
-    "intention_serious_getting_to_know": 0.5,
-    "intention_serious_friendship_first": 0.1,
-    "intention_serious_open": 0.7,
+    "intention_serious_getting_to_know": 0.7,
+    "intention_serious_friendship_first": 0.2,
+    "intention_serious_open": 0.4,
     "intention_getting_to_know_getting_to_know": 1.0,
     "intention_getting_to_know_friendship_first": 0.6,
     "intention_getting_to_know_open": 0.8,
@@ -2244,10 +2255,10 @@ class Intention(str, Enum):
 # Matrice de compatibilité des intentions
 # intention_a → intention_b → score (0.0 à 1.0)
 INTENTION_MATRIX = {
-    "serious":          {"serious": 1.0, "getting_to_know": 0.5, "friendship_first": 0.1, "open": 0.7},
-    "getting_to_know":  {"serious": 0.5, "getting_to_know": 1.0, "friendship_first": 0.6, "open": 0.8},
-    "friendship_first": {"serious": 0.1, "getting_to_know": 0.6, "friendship_first": 1.0, "open": 0.5},
-    "open":             {"serious": 0.7, "getting_to_know": 0.8, "friendship_first": 0.5, "open": 1.0},
+    "serious":          {"serious": 1.0, "getting_to_know": 0.7, "friendship_first": 0.2, "open": 0.4},
+    "getting_to_know":  {"serious": 0.7, "getting_to_know": 1.0, "friendship_first": 0.6, "open": 0.8},
+    "friendship_first": {"serious": 0.2, "getting_to_know": 0.6, "friendship_first": 1.0, "open": 0.5},
+    "open":             {"serious": 0.4, "getting_to_know": 0.8, "friendship_first": 0.5, "open": 1.0},
 }
 
 
@@ -2580,7 +2591,16 @@ NSFW_THRESHOLD_REVIEW = 0.4
 {
     "display_name": "Ama",
     "birth_date": "2000-03-15",
-    "gender": "woman",
+    # IMPORTANT : "gender" n'est PAS modifiable via cet endpoint.
+    # Le genre est déclaré à l'onboarding (étape basic_info) et verrouillé.
+    # Si "gender" est envoyé dans le body → 400 gender_not_modifiable.
+    # Raison : le genre est un paramètre structurel du matching (waitlist genrée,
+    # first impression feed, quality gate masculin). Permettre le changement
+    # ouvrirait la porte au catfish (photos de sa sœur + changement genre).
+    # Changement légitime : uniquement via admin PATCH /admin/users/{id}/gender
+    # avec invalidation du selfie + review humaine.
+    #
+    # "seeking_gender" EST modifiable librement (c'est une préférence, pas une identité).
     "seeking_gender": "men",
     "intention": "serious",
     "sector": "finance",
@@ -9199,13 +9219,13 @@ async def compute_lifestyle_scores(
                 score += jaccard * config.get("lifestyle_w_tags", 0.50)
 
         # ── 2. Matrice intentions (25% du score lifestyle) ──
-        # 4 intentions : serious, getting_to_know, friendship_first, open
+        # 4 intentions : serious, getting_to_know, friendship, open
         # Matrice de compatibilité :
-        #                   serious  getting_to_know  friendship_first  open
-        # serious             1.0        0.5               0.1           0.7
-        # getting_to_know     0.5        1.0               0.6           0.8
-        # friendship_first    0.1        0.6               1.0           0.5
-        # open                0.7        0.8               0.5           1.0
+        #                serious  getting_to_know  friendship  open
+        # serious          1.0        0.5            0.1       0.7
+        # getting_to_know  0.5        1.0            0.6       0.8
+        # friendship       0.1        0.6            1.0       0.5
+        # open             0.7        0.8            0.5       1.0
         user_intention = user.profile.intention
         candidate_intention = candidate.intention
 
@@ -9261,25 +9281,25 @@ INTENTION_COMPATIBILITY_MATRIX = {
     "serious": {
         "serious": 1.0,
         "getting_to_know": 0.5,
-        "friendship_first": 0.1,
+        "friendship": 0.1,
         "open": 0.7,
     },
     "getting_to_know": {
         "serious": 0.5,
         "getting_to_know": 1.0,
-        "friendship_first": 0.6,
+        "friendship": 0.6,
         "open": 0.8,
     },
-    "friendship_first": {
+    "friendship": {
         "serious": 0.1,
         "getting_to_know": 0.6,
-        "friendship_first": 1.0,
+        "friendship": 1.0,
         "open": 0.5,
     },
     "open": {
         "serious": 0.7,
         "getting_to_know": 0.8,
-        "friendship_first": 0.5,
+        "friendship": 0.5,
         "open": 1.0,
     },
 }
@@ -11640,3 +11660,268 @@ Total endpoints : 108 + 4 = 112
 # → PAS de suppression du ghost user (il pourrait s'inscrire plus tard
 #   par la porte 1 ou 2, le numéro sera reconnu)
 ```
+
+---
+
+# Mise à jour 9 — Genre immutable, premium downgrade, safety pipeline photos
+
+## Contexte
+
+Décisions produit prises lors de la conception du business model et du système anti-fraude. Ces règles affectent Sessions 10 et 11.
+
+## 1. Genre non modifiable par l'utilisateur
+
+**Règle :** le champ `gender` (man/woman/non_binary) est déclaré à l'onboarding (étape basic_info) et **verrouillé**. L'utilisateur ne peut PAS le modifier via `PUT /profiles/me`.
+
+**Raison :** le genre est un paramètre structurel du matching (waitlist genrée, first impression feed, quality gate masculin). Permettre le changement ouvrirait la porte au catfish (photos de sa sœur + changement genre).
+
+**Le champ `seeking_gender` (qui tu cherches) reste librement modifiable** — c'est une préférence, pas une identité.
+
+**Changement légitime :** uniquement via admin :
+
+```python
+# Session 10 — endpoint admin
+# PATCH /admin/users/{user_id}/gender
+async def admin_change_gender(user_id, new_gender, reason, admin_user, db):
+    """
+    Changement de genre par un admin après review humaine.
+    Conséquences automatiques :
+    1. Genre mis à jour
+    2. Selfie INVALIDÉ (nouveau selfie requis)
+    3. Behavior multiplier RESET à 1.0
+    4. Notification à l'utilisateur
+    5. Log audit trail
+    """
+    user = await db.get(User, user_id)
+    old_gender = user.profile.gender
+    user.profile.gender = new_gender
+    user.is_selfie_verified = False
+    # Reset behavior (nouveau genre = nouveau contexte)
+    await redis.delete(f"behavior:{user_id}")
+    
+    log.warning(
+        "admin_gender_change",
+        user_id=str(user_id),
+        old_gender=old_gender,
+        new_gender=new_gender,
+        reason=reason,
+        admin_id=str(admin_user.id),
+    )
+    
+    await notification_service.send_push(
+        user_id, "profile_update_required",
+        {"message_fr": "Ton profil a été mis à jour. Reprends un selfie."}
+    )
+```
+
+**Dans `profile_service.update_profile()` :**
+
+```python
+if "gender" in data:
+    raise AppException(
+        status.HTTP_400_BAD_REQUEST,
+        "gender_not_modifiable",
+        "Le genre ne peut pas être modifié. Contacte le support.",
+    )
+```
+
+## 2. Premium downgrade — Gel doux
+
+Quand un abonnement premium expire, les données au-delà des limites free ne sont **PAS supprimées**. Elles sont **gelées** (ignorées par le matching) et restent en DB pour réactivation instantanée.
+
+### Limites free vs premium
+
+| Ressource | Free | Premium |
+|-----------|------|---------|
+| Quartiers physiques (lives/works/hangs) | 3 | 5 |
+| Quartiers interested | 3 | 6 |
+| Spots | 5 | 12 |
+| Likes/jour | 5 | 10 (configurable à 15 via admin) |
+
+### Logique de downgrade
+
+```python
+# app/services/subscription_service.py
+
+async def downgrade_user_limits(user: User, db: AsyncSession) -> None:
+    """
+    Gel doux des extras premium. Appelé quand Subscription.expires_at < now.
+    Les données restent en DB, juste is_active_in_matching = False.
+    """
+    # Quartiers physiques : garder les 3 plus anciens
+    quartiers = sorted(user.user_quartiers, key=lambda q: q.created_at)
+    physical = [q for q in quartiers if q.relation_type != "interested"]
+    for i, q in enumerate(physical):
+        q.is_active_in_matching = (i < 3)
+    
+    # Quartiers interested : garder les 3 plus anciens
+    interested = [q for q in quartiers if q.relation_type == "interested"]
+    for i, q in enumerate(interested):
+        q.is_active_in_matching = (i < 3)
+    
+    # Spots : garder les 5 plus anciens
+    spots = sorted(user.user_spots, key=lambda s: s.created_at)
+    for i, s in enumerate(spots):
+        s.is_active_in_matching = (i < 5)
+    
+    # Premium flags
+    user.is_premium = False
+    
+    await db.commit()
+    
+    log.info("premium_downgraded", user_id=str(user.id))
+
+
+async def upgrade_user_limits(user: User, db: AsyncSession) -> None:
+    """Réactive tout quand premium se réactive."""
+    for q in user.user_quartiers:
+        q.is_active_in_matching = True
+    for s in user.user_spots:
+        s.is_active_in_matching = True
+    user.is_premium = True
+    await db.commit()
+```
+
+### Comportement côté mobile
+
+Quand premium expire :
+- Extras grisés dans l'app avec badge "Premium"
+- Notification push : "Ton premium a expiré. Tes quartiers et spots extras sont en pause."
+- Écran avec 2 choix : "Réactiver tout (Premium)" ou "Choisir lesquels garder"
+- Si l'utilisateur ne choisit pas en 48h → fallback : les 3/5 plus anciens restent actifs
+- Likes reviennent à 5/jour immédiatement
+- Likes-received revient au mode free (count + preview floutées)
+- Mode incognito désactivé immédiatement
+
+### Celery task (Session 11)
+
+```python
+# app/tasks/subscription_tasks.py
+
+async def check_expired_subscriptions():
+    """
+    Tourne toutes les heures. Détecte les subscriptions expirées
+    non encore traitées et déclenche le downgrade.
+    """
+    expired = await db.execute(
+        select(Subscription)
+        .where(Subscription.expires_at < func.now())
+        .where(Subscription.is_active == True)
+    )
+    for sub in expired.scalars():
+        sub.is_active = False
+        user = await db.get(User, sub.user_id)
+        await downgrade_user_limits(user, db)
+        await notification_service.send_push(
+            user.id, "premium_expired",
+            {"message_fr": "Ton premium a expiré. Tes extras sont en pause."}
+        )
+```
+
+## 3. Pipeline de modération photos — Session 10
+
+### Ordre du pipeline (6 checks)
+
+```
+Photo uploadée
+    │
+    ▼
+1. EXIF check (< 1ms, pur Python)
+    │ → Flag si no_exif + square_resolution + ai_software
+    ▼
+2. NSFW detection (~100ms, ONNX)
+    │ → Rejected si score > 0.7
+    │ → Manual_review si score 0.4-0.7
+    ▼
+3. Face detection (~50ms, YuNet ONNX)
+    │ → Manual_review si 0 visage détecté
+    ▼
+4. Selfie ↔ Photo face comparison (~200ms, ArcFace ONNX)
+    │ → Flag si similarity < 0.5
+    │ → Flag + notif admin si similarity < 0.3
+    ▼
+5. Genre consistency (inclus dans InsightFace)
+    │ → Flag pour review humaine si mismatch (PAS auto-reject — trans/NB)
+    ▼
+6. Diversité temporelle (< 1ms, EXIF dates)
+    │ → Flag si 4+ photos même date EXIF
+    ▼
+Decision : approved | manual_review | rejected
+```
+
+**Temps total : ~350ms par photo sur CPU.** Acceptable pour du Celery async.
+
+### Modèles ONNX nécessaires
+
+| Modèle | Usage | Taille | Source |
+|--------|-------|--------|--------|
+| ArcFace ResNet50 | Face embeddings (selfie ↔ photos) | ~30 MB | InsightFace GitHub |
+| YuNet | Face detection | ~2 MB | OpenCV contrib |
+| NSFW Classifier | Contenu adulte | ~50 MB | GantMan/nsfw_model |
+| **Total** | — | **~82 MB** | — |
+
+### Configuration ENV
+
+```bash
+PHOTO_MODERATION_MODE=manual        # manual | onnx | external | off
+EXIF_CHECK_ENABLED=true             # Toujours, même en mode manual
+FACE_VERIFICATION_ENABLED=false     # Active quand modèles installés
+FACE_VERIFICATION_MODEL_PATH=/models/arcface_r50.onnx
+FACE_GENDER_CHECK_ENABLED=false     # Active avec FACE_VERIFICATION
+NSFW_MODEL_PATH=/models/nsfw_detector.onnx
+FACE_DETECTION_MODEL_PATH=/models/yunet_face.onnx
+NSFW_THRESHOLD_REJECT=0.7
+NSFW_THRESHOLD_REVIEW=0.4
+```
+
+## 4. Targeted likes (feature flag, désactivé au MVP)
+
+Extension de `POST /feed/{profile_id}/like` pour accepter optionnellement :
+
+```python
+# Body enrichi (champs optionnels)
+{
+    "target_type": "photo" | "prompt" | "profile",  # default "profile"
+    "target_id": "uuid-de-la-photo-ou-index-du-prompt",
+    "comment": "Ton maquis préféré c'est aussi le mien !",  # max 200 chars
+}
+```
+
+Champs ajoutés sur Match :
+- `like_target_type: String(10) | None`
+- `like_target_id: String(100) | None`
+- `like_comment: String(200) | None`
+
+Quand `target_type != "profile"` et un `comment` est fourni :
+- L'ice-breaker auto-généré est **remplacé** par le commentaire de l'utilisateur
+- Plus humain, plus engageant
+
+**Feature flag :** `flag_targeted_likes_enabled` (default 0.0 = désactivé au MVP).
+Quand désactivé, les champs target_type/target_id/comment sont ignorés.
+
+### A/B testing des prompts (tracking passif)
+
+Quand un like cible un prompt spécifique, le compteur `prompt_like_count` est incrémenté dans le JSONB prompts du Profile. Permet de mesurer quels prompts attirent le plus de likes. Pas d'endpoint dédié — l'admin le consultera via `GET /admin/prompts/stats` (Session 10).
+
+## 5. Reply reminders (feature flag, activé au MVP)
+
+```python
+# app/services/reminder_service.py
+
+async def check_pending_replies(db: AsyncSession) -> list[dict]:
+    """
+    Trouve les conversations avec un message non-répondu depuis > 24h.
+    Max 1 reminder par match par 48h (pas de spam).
+    Respecte notification_preferences (flag reply_reminders).
+    
+    Stub Celery — scheduling en Session 11.
+    """
+    ...
+```
+
+**Feature flag :** `flag_reply_reminders_enabled` (default 1.0 = **activé**).
+C'est la seule feature activée par défaut car elle réduit le ghosting.
+
+**Template notification :**
+- FR : "Tu n'as pas encore répondu à {name}. Elle attend ta réponse."
+- EN : "You haven't replied to {name} yet. She's waiting for you."

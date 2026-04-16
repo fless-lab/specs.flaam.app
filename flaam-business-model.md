@@ -116,6 +116,56 @@ Toutes les fonctionnalites essentielles sont en free. Le premium offre :
 
 ---
 
+## Quand le premium expire — gel doux (pas de suppression)
+
+**Principe fondamental :** on ne supprime JAMAIS les donnees d'un utilisateur quand son premium expire. On les **gele** (desactivees dans le matching) et elles se reactuvent instantanement a la re-souscription.
+
+### Ce qui se passe a l'expiration
+
+| Element | Comportement |
+|---------|-------------|
+| **Quartiers physiques** | Les 3 plus anciens restent actifs. Les extras sont grises avec badge "Premium" |
+| **Quartiers interested** | Les 3 plus anciens restent actifs. Extras grises |
+| **Spots** | Les 5 plus anciens restent actifs. Extras grises |
+| **Likes/jour** | Retour immediat a 5/jour |
+| **Likes received** | Retour au mode free (count + 3 aperçus floutes) |
+| **Mode incognito** | Desactive immediatement, redevient visible |
+| **Rewind** | Retour a 1/jour |
+| **Badge premium** | Disparait |
+
+### UX a l'expiration
+
+1. **Notification push** : "Ton premium a expire. Tes quartiers et spots extras sont en pause."
+2. **Dans l'app** : ecran avec 2 choix :
+   - "Reactiver tout" → page payment
+   - "Choisir lesquels garder" → selection manuelle
+3. **Si aucun choix en 48h** → les plus anciens restent actifs automatiquement
+4. **Re-souscription** → tout se reactive instantanement, zero perte
+
+### Champ technique
+
+Les modeles `UserQuartier` et `UserSpot` ont un champ `is_active_in_matching` (bool, default True). Les scorers L1/L2 du matching filtrent uniquement sur `is_active_in_matching = True`.
+
+### Ce qu'on ne fait PAS a l'expiration (anti-patterns)
+
+- On ne supprime PAS les quartiers/spots extras de la DB
+- On ne reset PAS le behavior_multiplier
+- On n'envoie PAS de notification manipulatrice ("Tu vas rater des matchs !")
+- On ne bloque PAS la messagerie sur les matchs existants
+- On ne cache PAS les matchs obtenus en premium
+
+## Genre non modifiable
+
+Le genre (man/woman/non_binary) est declare a l'onboarding et **verrouille**. L'utilisateur ne peut pas le changer via l'app.
+
+**Raison :** le genre est un parametre structurel du matching (waitlist genree, first impression feed, quality gate masculin). Le changement ouvrirait la porte au catfish.
+
+**Seeking_gender** (qui tu cherches) reste **librement modifiable** — c'est une preference, pas une identite.
+
+**Changement legitime :** uniquement via admin (support humain) avec invalidation du selfie + review. Les personnes trans ou en transition sont accueillies, mais le processus est encadre pour la securite de tous.
+
+---
+
 ## Endpoint `GET /matches/likes-received` : 2 niveaux
 
 Cet endpoint a ete code en Session 6 en mode "403 free / complet premium". Il doit etre modifie en Session 7 pour implementer le mode 2-tier.
