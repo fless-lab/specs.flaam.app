@@ -2016,10 +2016,13 @@ MATCHING_DEFAULTS = {
     "daily_likes_premium": 50.0,
 
     # ── Intention matrix ──
+    # Matrice symétrique : on ne stocke que la moitié supérieure.
+    # La complétion symétrique (ex. intention_friendship_first_serious = 0.1)
+    # est gérée par INTENTION_COMPATIBILITY_MATRIX dans app/core/constants.py.
     "intention_serious_serious": 1.0,
-    "intention_serious_getting_to_know": 0.7,
-    "intention_serious_friendship_first": 0.2,
-    "intention_serious_open": 0.4,
+    "intention_serious_getting_to_know": 0.5,
+    "intention_serious_friendship_first": 0.1,
+    "intention_serious_open": 0.7,
     "intention_getting_to_know_getting_to_know": 1.0,
     "intention_getting_to_know_friendship_first": 0.6,
     "intention_getting_to_know_open": 0.8,
@@ -2241,10 +2244,10 @@ class Intention(str, Enum):
 # Matrice de compatibilité des intentions
 # intention_a → intention_b → score (0.0 à 1.0)
 INTENTION_MATRIX = {
-    "serious":          {"serious": 1.0, "getting_to_know": 0.7, "friendship_first": 0.2, "open": 0.4},
-    "getting_to_know":  {"serious": 0.7, "getting_to_know": 1.0, "friendship_first": 0.6, "open": 0.8},
-    "friendship_first": {"serious": 0.2, "getting_to_know": 0.6, "friendship_first": 1.0, "open": 0.5},
-    "open":             {"serious": 0.4, "getting_to_know": 0.8, "friendship_first": 0.5, "open": 1.0},
+    "serious":          {"serious": 1.0, "getting_to_know": 0.5, "friendship_first": 0.1, "open": 0.7},
+    "getting_to_know":  {"serious": 0.5, "getting_to_know": 1.0, "friendship_first": 0.6, "open": 0.8},
+    "friendship_first": {"serious": 0.1, "getting_to_know": 0.6, "friendship_first": 1.0, "open": 0.5},
+    "open":             {"serious": 0.7, "getting_to_know": 0.8, "friendship_first": 0.5, "open": 1.0},
 }
 
 
