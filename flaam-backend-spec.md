@@ -1469,6 +1469,82 @@ class Subscription(Base, UUIDMixin, TimestampMixin):
     user = relationship("User", back_populates="subscription")
 ```
 
+### 3.18b Payment
+
+```python
+# app/models/payment.py
+import uuid
+from datetime import datetime
+from sqlalchemy import String, Integer, ForeignKey, DateTime, JSON, func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.db.base import Base, UUIDMixin, TimestampMixin
+
+
+class Payment(Base, UUIDMixin, TimestampMixin):
+    """
+    Tracking de chaque tentative de paiement (succès ou échec).
+    Une Subscription peut avoir plusieurs Payments dans son historique
+    (paiement initial, renouvellements, retries après échec).
+
+    State machine : initialized → pending → success | failed | timeout
+    Voir section 36 pour les détails de la state machine.
+    """
+    __tablename__ = "payments"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True
+    )
+    subscription_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("subscriptions.id"), nullable=True
+    )
+
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    # En plus petite unité de la devise (centimes pour XOF)
+
+    currency: Mapped[str] = mapped_column(String(3), default="XOF", nullable=False)
+
+    provider: Mapped[str] = mapped_column(String(20), nullable=False)
+    # "paystack" | "mtn_momo" | "moov_money" | "flooz" | "tmoney" | "wave"
+
+    provider_reference: Mapped[str] = mapped_column(
+        String(100), unique=True, nullable=False, index=True
+    )
+    # Référence unique chez le provider (transaction_id Paystack, etc.)
+    # Sert aussi de clé pour matcher les webhooks entrants.
+
+    status: Mapped[str] = mapped_column(
+        String(20), default="initialized", nullable=False, index=True
+    )
+    # "initialized" | "pending" | "success" | "failed" | "timeout" | "refunded"
+
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(64), unique=True, nullable=True
+    )
+    # Pour éviter les doubles paiements en cas de retry réseau côté mobile.
+    # Le client génère un UUID v4 et le passe dans le header Idempotency-Key.
+
+    initialized_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Set quand status passe à success/failed/timeout/refunded
+
+    webhook_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Payload brut du webhook provider, gardé pour audit et debug
+
+    failure_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # "insufficient_funds" | "user_cancelled" | "timeout" | "invalid_pin" | etc.
+
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Nombre de tentatives de polling du status auprès du provider
+
+    user = relationship("User")
+    subscription = relationship("Subscription", backref="payments")
+```
+
 ### 3.19 NotificationPreference
 
 ```python
@@ -3772,6 +3848,108 @@ def verify_selfie(user_id: str, selfie_path: str, pose_requested: str):
     """
     ...
 ```
+
+### 16.1b Modération photo — 3 modes switchables par ENV
+
+La modération photo tourne dans un des 3 modes, pilotables par la variable d'environnement `PHOTO_MODERATION_MODE` :
+
+| Mode | Valeur ENV | Usage | Coût |
+|------|-----------|-------|------|
+| `manual` | `PHOTO_MODERATION_MODE=manual` | MVP, volumes < 100 photos/jour | 0 (temps admin) |
+| `onnx` | `PHOTO_MODERATION_MODE=onnx` | Production, volumes > 100/jour | 0 (CPU serveur) |
+| `external` | `PHOTO_MODERATION_MODE=external` | Scale, volumes > 1000/jour | ~$0.001/photo (Sightengine) |
+| `off` | `PHOTO_MODERATION_MODE=off` | Tests/dev uniquement | — |
+
+**Comportement commun aux 3 modes :**
+- Toute photo uploadée passe par `moderation_status="pending"` à la création
+- La photo est **visible quand même** pendant qu'elle est pending (on ne bloque pas l'UX)
+- Si rejected, la photo est masquée du profil mais gardée en DB 7 jours (appel possible)
+- L'admin peut toujours override manuellement via `PATCH /admin/photos/{id}/moderation`
+
+**Mode `manual` :**
+- Pas de worker Celery, pas de call API
+- Les photos restent `pending` jusqu'à action admin
+- Admin voit la queue via `GET /admin/photos/pending` et approve/reject à la main
+- Utilisé pour les premiers mois du lancement (MVP Lomé)
+
+**Mode `onnx` :**
+- Worker Celery `moderate_photo_onnx` charge 2 modèles en mémoire au démarrage :
+  - `NSFW_MODEL_PATH` : modèle de détection NSFW (NSFW_detector.onnx, ~50 MB)
+  - `FACE_MODEL_PATH` : face detection (YuNet ou UltraFace, ~2 MB)
+- Traite la queue en async
+- Seuils dans les constantes : `NSFW_THRESHOLD_REJECT=0.7`, `NSFW_THRESHOLD_REVIEW=0.4`
+- Si NSFW > 0.7 → `rejected`, raison "nsfw"
+- Si NSFW 0.4-0.7 → `manual_review` (fallback admin)
+- Si pas de visage détecté → `manual_review`, raison "no_face"
+- Sinon → `approved`
+
+**Mode `external` :**
+- Worker Celery `moderate_photo_external` appelle l'API Sightengine ou Google Vision
+- Même logique de seuils que `onnx`
+- Retries automatiques si l'API est down (max 3, backoff exponentiel)
+- Si > 3 échecs consécutifs : fallback vers `manual_review`
+
+**Mode `off` :**
+- Toute photo est auto-approuvée (`moderation_status="approved"`)
+- Uniquement pour les tests automatisés et le dev local sans modèles
+
+**Config .env pour les 3 modes :**
+
+```bash
+# Mode de modération (manual | onnx | external | off)
+PHOTO_MODERATION_MODE=manual
+
+# Mode onnx : chemins vers les modèles ONNX
+NSFW_MODEL_PATH=/models/nsfw_detector.onnx
+FACE_MODEL_PATH=/models/yunet_face.onnx
+
+# Mode external : credentials API
+SIGHTENGINE_USER=xxx
+SIGHTENGINE_SECRET=xxx
+SIGHTENGINE_MODELS=nudity-2.0,face-attributes
+
+# Seuils communs aux modes onnx et external
+NSFW_THRESHOLD_REJECT=0.7
+NSFW_THRESHOLD_REVIEW=0.4
+```
+
+**Stratégie de migration :**
+- Lancement Lomé : `manual` pendant 2-3 mois
+- 500+ inscriptions/mois : migration vers `onnx` (télécharger les modèles dans l'image Docker)
+- 2000+ inscriptions/mois : évaluer `external` si le CPU serveur sature
+
+**Code du dispatcher :**
+
+```python
+# app/services/photo_moderation_service.py
+from app.core.config import get_settings
+
+settings = get_settings()
+
+
+async def moderate_photo(photo_id: str) -> None:
+    """
+    Dispatcher qui appelle la bonne implémentation selon PHOTO_MODERATION_MODE.
+    """
+    mode = settings.photo_moderation_mode
+    
+    if mode == "off":
+        await _auto_approve(photo_id)
+    elif mode == "manual":
+        # Rien à faire, la photo reste pending jusqu'à action admin
+        return
+    elif mode == "onnx":
+        from app.tasks.photo_tasks import moderate_photo_onnx
+        moderate_photo_onnx.delay(photo_id)
+    elif mode == "external":
+        from app.tasks.photo_tasks import moderate_photo_external
+        moderate_photo_external.delay(photo_id)
+    else:
+        raise ValueError(f"Unknown PHOTO_MODERATION_MODE: {mode}")
+```
+
+Le même dispatcher est utilisé pour `verify_selfie` avec les mêmes modes.
+
 
 ```python
 # app/tasks/matching_tasks.py

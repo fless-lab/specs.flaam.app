@@ -629,11 +629,12 @@ Vérifie que :
 
 ---
 
-## SESSION 10 — Admin + Hardening final
+## SESSION 10 — Admin + Hardening final + Photo moderation
 
 ```
 Lis docs/flaam-api-endpoints.md section Admin (22 endpoints) et 
 docs/flaam-backend-spec.md sections 17-29 (RGPD, monitoring, CI/CD, etc.)
+Lis aussi section 16.1b (Modération photo — 3 modes switchables par ENV).
 
 Implémente :
 
@@ -643,7 +644,7 @@ Implémente :
    - Stats dashboard
    - Events : POST /admin/events (créer), PATCH /admin/events/{id} (publier/annuler),
      GET /admin/events (liste par status/ville), DELETE /admin/events/{id}
-   - Photos modération
+   - Photos modération (queue + approve/reject — détails ci-dessous)
    - Spots validation
    - Matching config
    - Feature flags
@@ -651,36 +652,120 @@ Implémente :
    - Ambassadrices (MàJ 7) : POST/DELETE/GET /admin/ambassadors
    - Waitlist (MàJ 7) : GET /admin/waitlist/stats, POST /admin/waitlist/release
 
-2. app/services/gdpr_service.py (spec section 17) :
+2. app/services/photo_moderation_service.py — dispatcher des 3 modes :
+   - Lis la variable settings.photo_moderation_mode ("manual" | "onnx" 
+     | "external" | "off")
+   - Mode "manual" : ne fait rien, la photo reste pending
+   - Mode "onnx" : enqueue moderate_photo_onnx
+   - Mode "external" : enqueue moderate_photo_external
+   - Mode "off" : auto-approve direct
+   - Appelé systématiquement après upload_photo dans photo_service
+
+3. app/tasks/photo_tasks.py — les 2 workers de modération :
+   
+   a. moderate_photo_onnx(photo_id) :
+      - Charge NSFW_MODEL_PATH + FACE_MODEL_PATH via onnxruntime 
+        (charger UNE fois au démarrage du worker, pas à chaque photo)
+      - Télécharge la photo medium (600px suffit pour la classification)
+      - Inférence NSFW → score 0-1
+      - Inférence face detection → nombre de visages
+      - Applique les seuils :
+        * NSFW > NSFW_THRESHOLD_REJECT (0.7) → moderation_status="rejected", 
+          moderation_reason="nsfw"
+        * NSFW entre THRESHOLD_REVIEW (0.4) et REJECT (0.7) → "manual_review"
+        * Pas de visage détecté ET score NSFW < 0.4 → "manual_review", 
+          reason="no_face"
+        * Sinon → "approved"
+      - Update Photo.nsfw_score, moderation_status, moderated_at
+   
+   b. moderate_photo_external(photo_id) :
+      - Appelle l'API Sightengine (endpoint /1.0/check.json)
+      - Credentials depuis SIGHTENGINE_USER + SIGHTENGINE_SECRET
+      - Modèles appelés : "nudity-2.0,face-attributes"
+      - Parse la réponse : nudity.sexual_activity, nudity.sexual_display, 
+        face.count
+      - Max 3 retries avec backoff 1s/5s/15s si l'API est down
+      - Si > 3 échecs : fallback vers "manual_review" pour review humaine
+      - Même seuils et même logique de statuts que le mode onnx
+
+4. Endpoints admin pour la modération manuelle :
+   - GET /admin/photos/pending?status=pending|manual_review — liste paginée
+   - GET /admin/photos/pending/stats — compteurs par statut
+   - PATCH /admin/photos/{photo_id}/moderation avec body 
+     {"action": "approve"|"reject", "reason": "..."}
+   - POST /admin/photos/bulk-approve avec liste d'IDs (gain de temps)
+   
+   Ces endpoints marchent dans TOUS les modes — même en mode "onnx", l'admin 
+   peut toujours override manuellement. En mode "manual", c'est la seule 
+   façon d'approuver les photos.
+
+5. Dockerfile : ajout conditionnel des modèles ONNX
+   - Si PHOTO_MODERATION_MODE=onnx au build → COPY models/ /models/
+   - Sinon, pas de copie (image plus petite)
+   - Ajouter onnxruntime aux requirements UNIQUEMENT si mode onnx ou external
+     (opencv-python-headless aussi pour le pré-processing d'images)
+   
+   En pratique : 2 requirements files :
+   - requirements.txt (commun)
+   - requirements-moderation.txt (onnx, opencv-python-headless, 
+     pillow-simd) — installé conditionnellement
+
+6. app/services/gdpr_service.py (spec section 17) :
    - initiate_deletion(user_id) → Phase 1 immédiate
    - Celery tasks pour Phase 2 (J+7) et Phase 3 (J+30)
 
-3. app/tasks/cleanup_tasks.py :
+7. app/tasks/cleanup_tasks.py :
    - purge_expired_matches (7 jours sans message)
    - purge_old_behavior_logs (90 jours)
    - purge_old_feed_caches (2 jours)
    - cleanup_account_histories (politique de rétention)
 
-4. app/core/middleware.py :
+8. app/core/middleware.py :
    - Security headers (X-Content-Type-Options, X-Frame-Options, etc.)
    - Request ID (X-Request-ID)
    - Structured logging (chaque requête loggée avec durée, status, user_id)
 
-5. Prometheus metrics endpoint (/metrics) si possible, sinon skip
+9. Prometheus metrics endpoint (/metrics) si possible, sinon skip
 
-6. Tests admin (vérifier que les routes admin requièrent le rôle admin)
+10. Tests :
+    - Routes admin retournent 403 pour un user normal
+    - Mode "off" : upload photo → auto-approved direct
+    - Mode "manual" : upload photo → reste pending
+    - Mode "onnx" : mock onnxruntime InferenceSession, vérifie que 
+      le dispatcher appelle bien moderate_photo_onnx
+    - Mode "external" : mock httpx pour Sightengine, vérifie parsing 
+      de la réponse
+    - PATCH /admin/photos/{id}/moderation approve → status="approved"
+    - PATCH /admin/photos/{id}/moderation reject → status="rejected", 
+      reason stored
 
-7. .github/workflows/backend.yml — CI pipeline :
-   - Lint (ruff)
-   - Tests (pytest)
-   - Build Docker image
-   - (Le déploiement sera configuré plus tard)
+11. .github/workflows/backend.yml — CI pipeline :
+    - Lint (ruff)
+    - Tests (pytest)
+    - Build Docker image (mode "off" pour les tests CI)
+    - (Le déploiement sera configuré plus tard)
+
+Stratégie MVP → production :
+- Session 10 : PHOTO_MODERATION_MODE=manual par défaut en .env.example
+- Lancement Lomé : admin modère à la main pendant 2-3 mois (~60 photos/jour, 
+  30min/jour à 2 personnes)
+- Quand > 100 photos/jour : basculer en mode onnx
+- Quand > 1000 photos/jour : évaluer external si CPU sature
+
+Téléchargement des modèles ONNX (pour plus tard, pas dans Session 10) :
+- NSFW : https://github.com/yahoo/open_nsfw ou 
+  https://github.com/GantMan/nsfw_model/releases (convertir en ONNX si 
+  nécessaire)
+- Face detection : YuNet (OpenCV) ou UltraFace RFB-320 (~2 MB, ONNX natif)
 
 Vérifie que :
 - Toutes les routes admin retournent 403 pour un user normal
+- Le dispatcher switche bien entre les 4 modes selon l'ENV
+- Les 4 modes sont testables (même sans les vrais modèles ONNX, via mocks)
 - La suppression RGPD phase 1 anonymise immédiatement
 - Le CI passe au vert
-- TOUS les 111 endpoints sont implémentés (vérifier avec docs/flaam-api-endpoints.md)
+- TOUS les 111 endpoints sont implémentés (vérifier avec 
+  docs/flaam-api-endpoints.md)
 ```
 
 ---
