@@ -9196,13 +9196,13 @@ async def compute_lifestyle_scores(
                 score += jaccard * config.get("lifestyle_w_tags", 0.50)
 
         # ── 2. Matrice intentions (25% du score lifestyle) ──
-        # 4 intentions : serious, getting_to_know, friendship, open
+        # 4 intentions : serious, getting_to_know, friendship_first, open
         # Matrice de compatibilité :
-        #                serious  getting_to_know  friendship  open
-        # serious          1.0        0.5            0.1       0.7
-        # getting_to_know  0.5        1.0            0.6       0.8
-        # friendship       0.1        0.6            1.0       0.5
-        # open             0.7        0.8            0.5       1.0
+        #                   serious  getting_to_know  friendship_first  open
+        # serious             1.0        0.5               0.1           0.7
+        # getting_to_know     0.5        1.0               0.6           0.8
+        # friendship_first    0.1        0.6               1.0           0.5
+        # open                0.7        0.8               0.5           1.0
         user_intention = user.profile.intention
         candidate_intention = candidate.intention
 
@@ -9258,25 +9258,25 @@ INTENTION_COMPATIBILITY_MATRIX = {
     "serious": {
         "serious": 1.0,
         "getting_to_know": 0.5,
-        "friendship": 0.1,
+        "friendship_first": 0.1,
         "open": 0.7,
     },
     "getting_to_know": {
         "serious": 0.5,
         "getting_to_know": 1.0,
-        "friendship": 0.6,
+        "friendship_first": 0.6,
         "open": 0.8,
     },
-    "friendship": {
+    "friendship_first": {
         "serious": 0.1,
         "getting_to_know": 0.6,
-        "friendship": 1.0,
+        "friendship_first": 1.0,
         "open": 0.5,
     },
     "open": {
         "serious": 0.7,
         "getting_to_know": 0.8,
-        "friendship": 0.5,
+        "friendship_first": 0.5,
         "open": 1.0,
     },
 }
